@@ -1,20 +1,12 @@
-// cache_probe.cpp
-// Linux/macOS: L1 D-cache size, associativity (ways), way size, cache line size
-// Timing: std::chrono::high_resolution_clock::now()
-// Build:
-//   Linux : g++   -O2 -march=native -std=c++17 cache_probe.cpp -o cache_probe
-//   macOS : clang++ -O2 -march=native -std=c++17 cache_probe.cpp -o cache_probe
-
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <numeric>
 #include <random>
 #include <vector>
+#include <string>
 
 #include <unistd.h> // sysconf
 
@@ -24,7 +16,76 @@
 #define NOINLINE
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define NOOPTIMISE(PTR) asm volatile("" : : "r"(PTR) : "memory")
+#else
+#define NOOPTIMISE(PTR) (void*)PTR
+#endif
+
+
 using high_resolution_clock = std::chrono::high_resolution_clock;
+
+
+
+// *------------------------------------------------------------------------------------*
+// |                                 CLI TOOLS                                          |
+// *------------------------------------------------------------------------------------*
+struct Options {
+    bool verbose = false;
+    size_t total_accesses = 16'000'00ULL;
+    int trials = 3;
+};
+
+
+static void print_usage(const char* prog) {
+    std::cerr << "Использование: " << prog << " [-v] [-i <int>|-i<int>] [-r <int>|-r<int>]\n"
+              << "  -v         Включает подробный режим\n"
+              << "  -i <int>   Количество итераций обхода данных\n"
+              << "  -r <int>   Количество прогонов вычислений\n"
+              << "  -h, --help Показать справку\n";
+}
+
+static Options parse_args(int argc, char* argv[]) {
+    Options opt;
+
+    for (int idx = 1; idx < argc; ++idx) {
+        std::string arg = argv[idx];
+
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            std::exit(0);
+        } else if (arg == "-v") {
+            opt.verbose = true;
+        } else if (arg == "-i" || arg.rfind("-i", 0) == 0) {
+            std::string valStr;
+            if (arg == "-i") {
+                if (idx + 1 >= argc) throw std::runtime_error("Ожидалось значение после -i");
+                valStr = argv[++idx];
+            } else {
+                valStr = arg.substr(2);
+                if (valStr.empty()) throw std::runtime_error("Ожидалось значение после -i");
+            }
+
+            size_t value = std::stoull(valStr);
+            opt.total_accesses = value;
+        } else if (arg == "-r" || arg.rfind("-r", 0) == 0) {
+            std::string valStr;
+            if (arg == "-r") {
+                if (idx + 1 >= argc) throw std::runtime_error("Ожидалось значение после -r");
+                valStr = argv[++idx];
+            } else {
+                valStr = arg.substr(2);
+                if (valStr.empty()) throw std::runtime_error("Ожидалось значение после -r");
+            }
+            int value = std::stoi(valStr);
+            opt.trials = value;
+        } else {
+            throw std::runtime_error("Неизвестный аргумент: " + arg);
+        }
+    }
+
+    return opt;
+}
 
 // *------------------------------------------------------------------------------------*
 // |                                DATA UTILITIES                                      |
@@ -73,7 +134,7 @@ static size_t detect_jump_bytes(const std::vector<SizePoint> &pts) {
                 break;
             }
         }
-        if (ok) return pts[i - 1].bytes; // последняя "быстрая" точка ~ L1
+        if (ok) return pts[i - 1].bytes;
     }
     return 0;
 }
@@ -82,12 +143,14 @@ static size_t detect_jump_bytes_relaxed(const std::vector<SizePoint> &pts) {
     double baseline = pts.empty() ? 0.0 : pts.front().ns_per_access;
     std::size_t estimated = 0;
 
+    const double exceed_base_ratio = 1.30;
+    const double local_jump_ratio = 1.15;
+
     for (std::size_t i = 1; i < pts.size(); ++i) {
         double prev = pts[i - 1].ns_per_access;
         double cur = pts[i].ns_per_access;
 
-
-        if (cur > baseline * 1.30 && cur > prev * 1.15) {
+        if (cur > baseline * exceed_base_ratio && cur > prev * local_jump_ratio) {
             estimated = pts[i].bytes;
             break;
         }
@@ -119,7 +182,6 @@ static std::vector<size_t> make_sizes_grid() {
 }
 
 static void build_random_cycle(std::vector<uint32_t> &next, uint32_t step = 16) {
-    // step=16 for uint32_t => 64 bytes (типичный cache line).
     std::vector<uint32_t> idx;
     idx.reserve(next.size() / step + 1);
     for (uint32_t i = 0; i < (uint32_t) next.size(); i += step) idx.push_back(i);
@@ -140,9 +202,9 @@ static std::size_t align_up(std::size_t x, std::size_t align) {
 
 
 // *------------------------------------------------------------------------------------*
-// |                                 L1 size probe                                      |
+// |                                 L1 SIZE PROBE                                      |
 // *------------------------------------------------------------------------------------*
-static NOINLINE double measure_ns_per_access_random_cycle(
+static NOINLINE double measure_size_L1(
         size_t bytes,
         uint64_t total_accesses,
         int trials = 3
@@ -165,9 +227,7 @@ static NOINLINE double measure_ns_per_access_random_cycle(
         for (uint64_t i = 0; i < total_accesses; ++i) cur = next[cur];
         auto t1 = high_resolution_clock::now();
 
-#if defined(__GNUC__) || defined(__clang__)
-        asm volatile("" : : "r"(cur) : "memory");
-#endif
+        NOOPTIMISE(cur);
 
         double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
         results.push_back(ns / double(total_accesses));
@@ -175,19 +235,24 @@ static NOINLINE double measure_ns_per_access_random_cycle(
     return median(results);
 }
 
-static size_t detect_size_L1() {
+static size_t detect_size_L1(const Options& opts) {
     const auto sizes = make_sizes_grid();
-    const uint64_t total_accesses = 1ULL * 1000ULL * 1000ULL;
 
     std::vector<SizePoint> pts;
     pts.reserve(sizes.size());
 
-    std::cout << "\nL1 size probe:\n";
-    std::cout << "Size(KB)\tns/access\n";
+    if(opts.verbose) {
+        std::cout << "\nL1 size probe:\n";
+        std::cout << "Size(KB)\tns/access\n";
+    }
+
     for (size_t bytes: sizes) {
-        double ns = measure_ns_per_access_random_cycle(bytes, total_accesses, 7);
+        double ns = measure_size_L1(bytes,  opts.total_accesses, opts.trials);
         pts.push_back({bytes, ns});
-        std::cout << (bytes / 1024) << "\t\t" << ns << "\n";
+
+        if(opts.verbose) {
+            std::cout << (bytes / 1024) << "\t\t" << ns << "\n";
+        }
     }
 
 
@@ -195,12 +260,12 @@ static size_t detect_size_L1() {
 }
 
 // *------------------------------------------------------------------------------------*
-// |                          L1 associativity (ways) probe                             |
+// |                          L1 ASSOCIATIVITY (WAYS) PROBE                             |
 // *------------------------------------------------------------------------------------*
-static NOINLINE double measure_set_conflict_ns_per_access(
+static NOINLINE double measure_associativity(
         size_t k_lines,
         size_t page_size,
-        uint64_t accesses,
+        uint64_t total_accesses,
         int trials = 3
 ) {
     const size_t bytes = k_lines * page_size + page_size;
@@ -228,75 +293,72 @@ static NOINLINE double measure_set_conflict_ns_per_access(
             *nodes[i] = (std::uintptr_t) nodes[i + 1];
         *nodes.back() = (std::uintptr_t) nodes.front();
 
-        volatile std::uintptr_t cur = (std::uintptr_t) nodes.front();
+        volatile auto cur =  std::uintptr_t(nodes.front());
 
         for (uint64_t i = 0; i < 200000; ++i) cur = *(std::uintptr_t *) cur;
 
         auto t0 = high_resolution_clock::now();
-        for (uint64_t i = 0; i < accesses; ++i) cur = *(std::uintptr_t *) cur;
+        for (uint64_t i = 0; i < total_accesses; ++i) cur = *(std::uintptr_t *) cur;
         auto t1 = high_resolution_clock::now();
 
-#if defined(__GNUC__) || defined(__clang__)
-        asm volatile("" : : "r"(cur) : "memory");
-#endif
+        NOOPTIMISE(cur);
 
         double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
-        results.push_back(ns / (double) accesses);
+        results.push_back(ns / (double) total_accesses);
     }
 
     free(raw);
     return median(results);
 }
 
-static size_t detect_associativity_L1(size_t page_size) {
+static size_t detect_associativity_L1(size_t page_size, const Options& opts) {
     const size_t k_min = 1;
     const size_t k_max = 32;
-    const uint64_t total_accesses = 8ULL * 1000ULL * 1000ULL;
 
 
     std::vector<SizePoint> pts;
     pts.reserve(k_max - k_min + 1);
 
-    std::cout << "\nAssociativity probe (same-set via page stride):\n";
-    std::cout << "k_lines\t ns/access\n";
+    if(opts.verbose) {
+        std::cout << "\nAssociativity probe (same-set via page stride):\n";
+        std::cout << "k_lines\t ns/access\n";
+    }
 
     for (size_t k = k_min; k <= k_max; ++k) {
-        double ns = measure_set_conflict_ns_per_access(k, page_size, total_accesses, 9);
+        double ns = measure_associativity(k, page_size,  opts.total_accesses, opts.trials);
         pts.push_back({k, ns});
-        std::cout << k << "\t " << ns << "\n";
+
+        if(opts.verbose) {
+            std::cout << k << "\t " << ns << "\n";
+        }
     }
 
     return detect_jump_bytes(pts);
 }
 
 // *------------------------------------------------------------------------------------*
-// |                                 L1 stride probe                                    |
+// |                                 L1 STRIDE PROBE                                    |
 // *------------------------------------------------------------------------------------*
 struct Node {
     Node *next;
 };
 
 static NOINLINE double measure_stride(
-        std::size_t mib,
         std::size_t page_size,
         std::size_t stride,
-        std::uint64_t target_steps,
+        std::uint64_t total_accesses,
         int trials = 3
 ) {
-    std::size_t bytes = mib * 1024ull * 1024ull;
+    std::size_t bytes = 10 * 1024ull * 1024ull;
     bytes = align_up(bytes, page_size);
 
     void *mem = nullptr;
-    int rc = ::posix_memalign(&mem, page_size, bytes);
-    if (rc != 0 || !mem) {
-        std::cerr << "posix_memalign failed (rc=" << rc << ")\n";
-        return 1;
-    }
+    if (posix_memalign(&mem, page_size, bytes) != 0) return 0.0;
     std::memset(mem, 0, bytes);
 
     auto *base = reinterpret_cast<std::uint8_t *>(mem);
 
-    // stride должен вмещать Node и быть кратным выравниванию указателя
+
     const std::size_t ptrAlign = alignof(Node);
     stride = std::max(stride, sizeof(Node));
     stride = align_up(stride, ptrAlign);
@@ -304,14 +366,12 @@ static NOINLINE double measure_stride(
     std::size_t count = bytes / stride;
     if (count < 2) return std::numeric_limits<double>::infinity();
 
-    // Создаём случайный порядок, чтобы снизить влияние аппаратного prefetch
     std::vector<std::size_t> idx(count);
     for (std::size_t i = 0; i < count; ++i) idx[i] = i;
 
-    std::mt19937_64 rng(123456789ULL); // фиксированный seed для воспроизводимости
+    std::mt19937_64 rng(123456789ULL);
     std::shuffle(idx.begin(), idx.end(), rng);
 
-    // Строим кольцо
     for (std::size_t i = 0; i < count; ++i) {
         auto cur_off = idx[i] * stride;
         auto next_off = idx[(i + 1) % count] * stride;
@@ -322,13 +382,10 @@ static NOINLINE double measure_stride(
 
     Node *start = reinterpret_cast<Node *>(base + idx[0] * stride);
 
-    // Сколько шагов делать, чтобы было достаточно "длинно"
-    // (pointer chasing не векторизуется и почти не оптимизируется)
-    std::uint64_t steps = target_steps;
-    // Если узлов мало — гоняем по кругу много раз
+
+    std::uint64_t steps = total_accesses;
     if (steps < count * 16) steps = static_cast<std::uint64_t>(count) * 16;
 
-    // Небольшой прогрев
     volatile Node *p = start;
     for (std::uint64_t i = 0; i < std::min<std::uint64_t>(steps / 8, 2'000'000ULL); ++i) {
         p = p->next;
@@ -345,10 +402,7 @@ static NOINLINE double measure_stride(
         }
         auto t1 = std::chrono::steady_clock::now();
 
-        // "используем" q, чтобы компилятор не выбросил цикл
-        if (reinterpret_cast<std::uintptr_t>(q) == 0xdeadbeef) {
-            std::cerr << "impossible\n";
-        }
+        NOOPTIMISE(q);
 
         auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
         double ns_per = static_cast<double>(ns) / static_cast<double>(steps);
@@ -361,33 +415,36 @@ static NOINLINE double measure_stride(
 }
 
 
-static size_t detect_stride_size_L1(size_t page_size) {
-    std::size_t mib = 10;
+static size_t detect_stride_size_L1(size_t page_size, const Options& opts) {
     std::size_t max_stride = 1024;
-    const std::uint64_t total_accesses = 16'000'00ULL;
 
-
-    std::cout << "\n\nStride bytes\tns/access\n\n";
-
+    if(opts.verbose) {
+        std::cout << "\n\nStride bytes\tns/access\n\n";
+    }
 
     std::vector<SizePoint> pts;
 
-    // Stride: степени двойки от 8 до max_stride
     for (std::size_t stride = 8; stride <= max_stride; stride *= 2) {
-        double ns = measure_stride(mib, page_size, stride, total_accesses);
+        double ns = measure_stride(page_size, stride, opts.total_accesses, opts.trials);
         pts.push_back({stride, ns});
-        std::cout << (stride) << "\t\t" << ns << "\n";
+        if(opts.verbose) {
+            std::cout << (stride) << "\t\t" << ns << "\n";
+        }
     }
 
     return detect_jump_bytes_relaxed(pts);
 }
 
-int main() {
+
+int main(int argc, char**argv) {
+
+    auto options = parse_args(argc, argv);
+
     const auto page_size = size_t(sysconf(_SC_PAGESIZE));
     std::cout << "Page size: " << page_size << " bytes\n";
 
-//     1) L1 size
-    size_t l1_bytes = detect_size_L1();
+    // 1) L1 size
+    size_t l1_bytes = detect_size_L1(options);
     if (l1_bytes == 0) {
         std::cout << "\nL1 size jump not reliably detected in 2KB..1MB.\n";
     } else {
@@ -395,7 +452,7 @@ int main() {
     }
 
     // 2) associativity (ways)
-    size_t ways = detect_associativity_L1(page_size);
+    size_t ways = detect_associativity_L1(page_size, options);
     if (ways == 0) {
         std::cout << "\nL1 associativity not reliably detected.\n";
     } else {
@@ -403,13 +460,12 @@ int main() {
     }
 
     // 3) cache line size
-    size_t line_bytes = detect_stride_size_L1(page_size);
+    size_t line_bytes = detect_stride_size_L1(page_size, options);
     if (line_bytes == 0) {
         std::cout << "\nL1 cache line size not reliably detected.\n";
     } else {
         std::cout << "\nEstimated L1 D-cache line size: ~" << line_bytes << " B\n";
     }
-
 
     return 0;
 }
