@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <chrono>
+#include <functional>
 #include <unistd.h>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -16,7 +17,7 @@
 #define NOINLINE
 #endif
 
-#define NOOPTIMISE(PTR) if(PTR == 0) { std::cout << PTR; }
+#define NOOPTIMISE(PTR) fprintf(stdin,"%p",(PTR))
 
 using high_resolution_clock = std::chrono::high_resolution_clock;
 
@@ -26,7 +27,7 @@ using high_resolution_clock = std::chrono::high_resolution_clock;
 struct Options {
     bool verbose = false;
     size_t total_accesses = 16'000'00ULL;
-    int trials = 3;
+    int trials = 7;
 };
 
 
@@ -193,6 +194,17 @@ static std::size_t align_up(std::size_t x, std::size_t align) {
     return (x + align - 1) & ~(align - 1);
 }
 
+
+static NOINLINE double measure(size_t warm_up, size_t main_loop, const std::function<void(size_t)> &func) {
+    func(warm_up);
+
+    auto t0 = high_resolution_clock::now();
+    func(main_loop);
+    auto t1 = high_resolution_clock::now();
+
+    return std::chrono::duration<double, std::nano>(t1 - t0).count();
+}
+
 // *------------------------------------------------------------------------------------*
 // |                                 L1 SIZE PROBE                                      |
 // *------------------------------------------------------------------------------------*
@@ -208,18 +220,14 @@ static NOINLINE double measure_size_L1(
     results.reserve(trials);
 
     for (int t = 0; t < trials; ++t) {
-        uint32_t cur = 0;
 
-        // warmup
-        for (uint64_t i = 0; i < 200000; ++i) cur = next[cur];
+        double ns = measure(200000, total_accesses, [&next](size_t count) {
+            uint32_t cur = 0;
+            for (uint64_t i = 0; i < count; ++i) cur = next[cur];
 
-        auto t0 = high_resolution_clock::now();
-        for (uint64_t i = 0; i < total_accesses; ++i) cur = next[cur];
-        auto t1 = high_resolution_clock::now();
+            NOOPTIMISE(next.data() + cur);
+        });
 
-        NOOPTIMISE(cur);
-
-        double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
         results.push_back(ns / double(total_accesses));
     }
     return median(results);
@@ -284,17 +292,14 @@ static NOINLINE double measure_associativity(
             *nodes[i] = (std::uintptr_t) nodes[i + 1];
         *nodes.back() = (std::uintptr_t) nodes.front();
 
-        auto cur = std::uintptr_t(nodes.front());
+        double ns = measure(200000, total_accesses, [&nodes](size_t count) {
+            auto cur = std::uintptr_t(nodes.front());
 
-        for (uint64_t i = 0; i < 200000; ++i) cur = *(std::uintptr_t *) cur;
+            for (uint64_t i = 0; i < count; ++i) cur = *(std::uintptr_t *) cur;
 
-        auto t0 = high_resolution_clock::now();
-        for (uint64_t i = 0; i < total_accesses; ++i) cur = *(std::uintptr_t *) cur;
-        auto t1 = high_resolution_clock::now();
+            NOOPTIMISE((std::uintptr_t *)cur);
+        });
 
-        NOOPTIMISE(cur);
-
-        double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
         results.push_back(ns / (double) total_accesses);
     }
 
@@ -350,25 +355,25 @@ static NOINLINE double measure_stride(
 
     auto *base = reinterpret_cast<std::uint8_t *>(mem);
 
+    const std::size_t ptrAlign = alignof(Node);
+    stride = std::max(stride, sizeof(Node));
+    stride = align_up(stride, ptrAlign);
 
-    double best_ns_per = std::numeric_limits<double>::infinity();
+    std::size_t count = bytes / stride;
+    if (count < 2) {
+        free(mem);
+        return std::numeric_limits<double>::infinity();
+    }
+
+    std::vector<double> results;
+    results.reserve(trials);
 
     for (int t = 0; t < trials; ++t) {
-
-        const std::size_t ptrAlign = alignof(Node);
-        stride = std::max(stride, sizeof(Node));
-        stride = align_up(stride, ptrAlign);
-
-        std::size_t count = bytes / stride;
-        if (count < 2) {
-            free(mem);
-            return std::numeric_limits<double>::infinity();
-        }
 
         std::vector<std::size_t> idx(count);
         for (std::size_t i = 0; i < count; ++i) idx[i] = i;
 
-        std::mt19937_64 rng(123456789ULL);
+        std::mt19937_64 rng(1212ULL * t);
         std::shuffle(idx.begin(), idx.end(), rng);
 
         for (std::size_t i = 0; i < count; ++i) {
@@ -385,28 +390,21 @@ static NOINLINE double measure_stride(
         std::uint64_t steps = total_accesses;
         if (steps < count * 16) steps = static_cast<std::uint64_t>(count) * 16;
 
-        Node *p = start;
-        for (std::uint64_t i = 0; i < 200000; ++i) {
-            p = p->next;
-        }
+        double ns = measure(200000, steps, [&start](size_t count) {
+            Node *p = start;
 
-        p = start;
-        auto t0 = std::chrono::steady_clock::now();
-        for (std::uint64_t i = 0; i < steps; ++i) {
-            p = p->next;
-        }
-        auto t1 = std::chrono::steady_clock::now();
+            for (uint64_t i = 0; i < count; ++i) p = p->next;
 
-        NOOPTIMISE(p);
+            start = p;
+            NOOPTIMISE(p);
+        });
 
-        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-        double ns_per = static_cast<double>(ns) / static_cast<double>(steps);
-        best_ns_per = std::min(best_ns_per, ns_per);
+        results.push_back(ns / static_cast<double>(steps));
     }
 
     free(mem);
 
-    return best_ns_per;
+    return median(results);
 }
 
 
