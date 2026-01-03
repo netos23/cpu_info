@@ -7,8 +7,8 @@
 #include <random>
 #include <vector>
 #include <string>
-
-#include <unistd.h> // sysconf
+#include <chrono>
+#include <unistd.h>
 
 #if defined(__GNUC__) || defined(__clang__)
 #define NOINLINE __attribute__((noinline))
@@ -16,16 +16,9 @@
 #define NOINLINE
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-#define NOOPTIMISE(PTR) asm volatile("" : : "r"(PTR) : "memory")
-#else
-#define NOOPTIMISE(PTR) (void*)PTR
-#endif
-
+#define NOOPTIMISE(PTR) if(PTR == 0) { std::cout << PTR; }
 
 using high_resolution_clock = std::chrono::high_resolution_clock;
-
-
 
 // *------------------------------------------------------------------------------------*
 // |                                 CLI TOOLS                                          |
@@ -37,7 +30,7 @@ struct Options {
 };
 
 
-static void print_usage(const char* prog) {
+static void print_usage(const char *prog) {
     std::cerr << "Использование: " << prog << " [-v] [-i <int>|-i<int>] [-r <int>|-r<int>]\n"
               << "  -v         Включает подробный режим\n"
               << "  -i <int>   Количество итераций обхода данных\n"
@@ -45,7 +38,7 @@ static void print_usage(const char* prog) {
               << "  -h, --help Показать справку\n";
 }
 
-static Options parse_args(int argc, char* argv[]) {
+static Options parse_args(int argc, char *argv[]) {
     Options opt;
 
     for (int idx = 1; idx < argc; ++idx) {
@@ -200,7 +193,6 @@ static std::size_t align_up(std::size_t x, std::size_t align) {
     return (x + align - 1) & ~(align - 1);
 }
 
-
 // *------------------------------------------------------------------------------------*
 // |                                 L1 SIZE PROBE                                      |
 // *------------------------------------------------------------------------------------*
@@ -209,16 +201,14 @@ static NOINLINE double measure_size_L1(
         uint64_t total_accesses,
         int trials = 3
 ) {
-    const size_t n = std::max<size_t>(bytes / sizeof(uint32_t), 1024);
-    std::vector<uint32_t> next(n);
+    std::vector<uint32_t> next(bytes);
     build_random_cycle(next, 16);
-
 
     std::vector<double> results;
     results.reserve(trials);
 
     for (int t = 0; t < trials; ++t) {
-        volatile uint32_t cur = 0;
+        uint32_t cur = 0;
 
         // warmup
         for (uint64_t i = 0; i < 200000; ++i) cur = next[cur];
@@ -235,23 +225,24 @@ static NOINLINE double measure_size_L1(
     return median(results);
 }
 
-static size_t detect_size_L1(const Options& opts) {
+static size_t detect_size_L1(const Options &opts) {
     const auto sizes = make_sizes_grid();
 
     std::vector<SizePoint> pts;
     pts.reserve(sizes.size());
 
-    if(opts.verbose) {
+    if (opts.verbose) {
         std::cout << "\nL1 size probe:\n";
         std::cout << "Size(KB)\tns/access\n";
     }
 
     for (size_t bytes: sizes) {
-        double ns = measure_size_L1(bytes,  opts.total_accesses, opts.trials);
+        const size_t n = std::max<size_t>(bytes / sizeof(uint32_t), 1024);
+        double ns = measure_size_L1(n, opts.total_accesses, opts.trials);
         pts.push_back({bytes, ns});
 
-        if(opts.verbose) {
-            std::cout << (bytes / 1024) << "\t\t" << ns << "\n";
+        if (opts.verbose) {
+            std::cout << std::to_string(bytes / 1024) << "\t\t" << ns << "\n";
         }
     }
 
@@ -269,8 +260,8 @@ static NOINLINE double measure_associativity(
         int trials = 3
 ) {
     const size_t bytes = k_lines * page_size + page_size;
-    void *raw = nullptr;
-    if (posix_memalign(&raw, page_size, bytes) != 0) return 0.0;
+    void *raw = aligned_alloc(page_size, bytes);
+    if (raw == nullptr) return 0.0;
     std::memset(raw, 1, bytes);
 
 
@@ -293,7 +284,7 @@ static NOINLINE double measure_associativity(
             *nodes[i] = (std::uintptr_t) nodes[i + 1];
         *nodes.back() = (std::uintptr_t) nodes.front();
 
-        volatile auto cur =  std::uintptr_t(nodes.front());
+        auto cur = std::uintptr_t(nodes.front());
 
         for (uint64_t i = 0; i < 200000; ++i) cur = *(std::uintptr_t *) cur;
 
@@ -311,7 +302,7 @@ static NOINLINE double measure_associativity(
     return median(results);
 }
 
-static size_t detect_associativity_L1(size_t page_size, const Options& opts) {
+static size_t detect_associativity_L1(size_t page_size, const Options &opts) {
     const size_t k_min = 1;
     const size_t k_max = 32;
 
@@ -319,16 +310,16 @@ static size_t detect_associativity_L1(size_t page_size, const Options& opts) {
     std::vector<SizePoint> pts;
     pts.reserve(k_max - k_min + 1);
 
-    if(opts.verbose) {
+    if (opts.verbose) {
         std::cout << "\nAssociativity probe (same-set via page stride):\n";
         std::cout << "k_lines\t ns/access\n";
     }
 
     for (size_t k = k_min; k <= k_max; ++k) {
-        double ns = measure_associativity(k, page_size,  opts.total_accesses, opts.trials);
+        double ns = measure_associativity(k, page_size, opts.total_accesses, opts.trials);
         pts.push_back({k, ns});
 
-        if(opts.verbose) {
+        if (opts.verbose) {
             std::cout << k << "\t " << ns << "\n";
         }
     }
@@ -352,73 +343,77 @@ static NOINLINE double measure_stride(
     std::size_t bytes = 10 * 1024ull * 1024ull;
     bytes = align_up(bytes, page_size);
 
-    void *mem = nullptr;
-    if (posix_memalign(&mem, page_size, bytes) != 0) return 0.0;
+
+    void *mem = aligned_alloc(page_size, bytes);
+    if (mem == nullptr) return 0.0;
     std::memset(mem, 0, bytes);
 
     auto *base = reinterpret_cast<std::uint8_t *>(mem);
 
 
-    const std::size_t ptrAlign = alignof(Node);
-    stride = std::max(stride, sizeof(Node));
-    stride = align_up(stride, ptrAlign);
-
-    std::size_t count = bytes / stride;
-    if (count < 2) return std::numeric_limits<double>::infinity();
-
-    std::vector<std::size_t> idx(count);
-    for (std::size_t i = 0; i < count; ++i) idx[i] = i;
-
-    std::mt19937_64 rng(123456789ULL);
-    std::shuffle(idx.begin(), idx.end(), rng);
-
-    for (std::size_t i = 0; i < count; ++i) {
-        auto cur_off = idx[i] * stride;
-        auto next_off = idx[(i + 1) % count] * stride;
-        Node *cur = reinterpret_cast<Node *>(base + cur_off);
-        Node *next = reinterpret_cast<Node *>(base + next_off);
-        cur->next = next;
-    }
-
-    Node *start = reinterpret_cast<Node *>(base + idx[0] * stride);
-
-
-    std::uint64_t steps = total_accesses;
-    if (steps < count * 16) steps = static_cast<std::uint64_t>(count) * 16;
-
-    volatile Node *p = start;
-    for (std::uint64_t i = 0; i < std::min<std::uint64_t>(steps / 8, 2'000'000ULL); ++i) {
-        p = p->next;
-    }
-
     double best_ns_per = std::numeric_limits<double>::infinity();
 
     for (int t = 0; t < trials; ++t) {
-        volatile Node *q = start;
 
+        const std::size_t ptrAlign = alignof(Node);
+        stride = std::max(stride, sizeof(Node));
+        stride = align_up(stride, ptrAlign);
+
+        std::size_t count = bytes / stride;
+        if (count < 2) {
+            free(mem);
+            return std::numeric_limits<double>::infinity();
+        }
+
+        std::vector<std::size_t> idx(count);
+        for (std::size_t i = 0; i < count; ++i) idx[i] = i;
+
+        std::mt19937_64 rng(123456789ULL);
+        std::shuffle(idx.begin(), idx.end(), rng);
+
+        for (std::size_t i = 0; i < count; ++i) {
+            auto cur_off = idx[i] * stride;
+            auto next_off = idx[(i + 1) % count] * stride;
+            Node *cur = reinterpret_cast<Node *>(base + cur_off);
+            Node *next = reinterpret_cast<Node *>(base + next_off);
+            cur->next = next;
+        }
+
+        Node *start = reinterpret_cast<Node *>(base + idx[0] * stride);
+
+
+        std::uint64_t steps = total_accesses;
+        if (steps < count * 16) steps = static_cast<std::uint64_t>(count) * 16;
+
+        Node *p = start;
+        for (std::uint64_t i = 0; i < 200000; ++i) {
+            p = p->next;
+        }
+
+        p = start;
         auto t0 = std::chrono::steady_clock::now();
         for (std::uint64_t i = 0; i < steps; ++i) {
-            q = q->next;
+            p = p->next;
         }
         auto t1 = std::chrono::steady_clock::now();
 
-        NOOPTIMISE(q);
+        NOOPTIMISE(p);
 
         auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
         double ns_per = static_cast<double>(ns) / static_cast<double>(steps);
         best_ns_per = std::min(best_ns_per, ns_per);
     }
 
-    free(base);
+    free(mem);
 
     return best_ns_per;
 }
 
 
-static size_t detect_stride_size_L1(size_t page_size, const Options& opts) {
+static size_t detect_stride_size_L1(size_t page_size, const Options &opts) {
     std::size_t max_stride = 1024;
 
-    if(opts.verbose) {
+    if (opts.verbose) {
         std::cout << "\n\nStride bytes\tns/access\n\n";
     }
 
@@ -427,7 +422,7 @@ static size_t detect_stride_size_L1(size_t page_size, const Options& opts) {
     for (std::size_t stride = 8; stride <= max_stride; stride *= 2) {
         double ns = measure_stride(page_size, stride, opts.total_accesses, opts.trials);
         pts.push_back({stride, ns});
-        if(opts.verbose) {
+        if (opts.verbose) {
             std::cout << (stride) << "\t\t" << ns << "\n";
         }
     }
@@ -436,7 +431,7 @@ static size_t detect_stride_size_L1(size_t page_size, const Options& opts) {
 }
 
 
-int main(int argc, char**argv) {
+int main(int argc, char **argv) {
 
     auto options = parse_args(argc, argv);
 
