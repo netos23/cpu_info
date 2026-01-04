@@ -101,7 +101,11 @@ static double median(std::vector<double> &v) {
     return m;
 }
 
-static size_t detect_jump_bytes(const std::vector<SizePoint> &pts) {
+static size_t detect_jump_bytes(
+        const std::vector<SizePoint> &pts,
+        double exceed_base_ratio = 1.35,
+        double local_jump_ratio = 1.18
+) {
     if (pts.size() < 10) return 0;
 
     const size_t baseN = std::min<size_t>(8, pts.size());
@@ -110,8 +114,6 @@ static size_t detect_jump_bytes(const std::vector<SizePoint> &pts) {
     for (size_t i = 0; i < baseN; ++i) baseVals.push_back(pts[i].ns_per_access);
     const double base = median(baseVals);
 
-    const double exceed_base_ratio = 1.35;
-    const double local_jump_ratio = 1.18;
     const int confirm_points = 3;
 
     for (size_t i = 1; i + confirm_points < pts.size(); ++i) {
@@ -225,7 +227,7 @@ static NOINLINE double measure_size_L1(
             uint32_t cur = 0;
             for (uint64_t i = 0; i < count; ++i) cur = next[cur];
 
-            NOOPTIMISE(next.data() + cur);
+            NOOPTIMISE(&next + cur);
         });
 
         results.push_back(ns / double(total_accesses));
@@ -297,7 +299,7 @@ static NOINLINE double measure_associativity(
 
             for (uint64_t i = 0; i < count; ++i) cur = *(std::uintptr_t *) cur;
 
-            NOOPTIMISE((std::uintptr_t *)cur);
+            NOOPTIMISE((std::uintptr_t *) cur);
         });
 
         results.push_back(ns / (double) total_accesses);
@@ -308,7 +310,7 @@ static NOINLINE double measure_associativity(
 }
 
 static size_t detect_associativity_L1(size_t page_size, const Options &opts) {
-    const size_t k_min = 1;
+    const size_t k_min = 2;
     const size_t k_max = 32;
 
 
@@ -320,7 +322,7 @@ static size_t detect_associativity_L1(size_t page_size, const Options &opts) {
         std::cout << "k_lines\t ns/access\n";
     }
 
-    for (size_t k = k_min; k <= k_max; ++k) {
+    for (size_t k = k_min; k <= k_max; k += 2) {
         double ns = measure_associativity(k, page_size, opts.total_accesses, opts.trials);
         pts.push_back({k, ns});
 
@@ -329,7 +331,7 @@ static size_t detect_associativity_L1(size_t page_size, const Options &opts) {
         }
     }
 
-    return detect_jump_bytes(pts);
+    return detect_jump_bytes(pts, 1.2, 1.05);
 }
 
 // *------------------------------------------------------------------------------------*
